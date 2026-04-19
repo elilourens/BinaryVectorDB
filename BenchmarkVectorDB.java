@@ -69,14 +69,25 @@ public class BenchmarkVectorDB {
         float[][] corpus  = loadEmbeddings(embeddingPath(dim, "corpus"),  NUM_VECTORS);
         float[][] queries = loadEmbeddings(embeddingPath(dim, "queries"), NUM_QUERIES);
 
-        // ── 1. Build index ────────────────────────────────────────────────────
-        System.out.printf("  Building index (%,d vectors)...", corpus.length);
+        // ── 1a. Build flat index ──────────────────────────────────────────────
+        System.out.printf("  Building flat index (%,d vectors)...", corpus.length);
         BinaryVectorDB db = new BinaryVectorDB(dim);
         long t0 = System.nanoTime();
         for (int i = 0; i < corpus.length; i++)
             db.addVector(corpus[i], new String[]{String.valueOf(i)});
-        long buildMs = (System.nanoTime() - t0) / 1_000_000;
-        System.out.printf(" %d ms%n", buildMs);
+        long flatBuildMs = (System.nanoTime() - t0) / 1_000_000;
+        System.out.printf(" %d ms%n", flatBuildMs);
+
+        // ── 1b. Build IVF index ───────────────────────────────────────────────
+        System.out.printf("  Building IVF index (K=%d, nprobes=%d)...",
+                IVFBinaryVectorDB.NCLUSTERS, IVFBinaryVectorDB.NPROBES);
+        IVFBinaryVectorDB ivf = new IVFBinaryVectorDB(dim);
+        long ti0 = System.nanoTime();
+        for (int i = 0; i < corpus.length; i++)
+            ivf.addVector(corpus[i], new String[]{String.valueOf(i)});
+        ivf.build();
+        long ivfBuildMs = (System.nanoTime() - ti0) / 1_000_000;
+        System.out.printf(" %d ms  [%s]%n", ivfBuildMs, ivf.stats());
 
         // ── 2. Ground truth — exact cosine similarity ─────────────────────────
         System.out.print("  Computing ground truth (exact cosine search)...");
@@ -92,41 +103,56 @@ public class BenchmarkVectorDB {
         long exactNs = System.nanoTime() - t1;
         System.out.printf(" %.1f ms%n", exactNs / 1e6);
 
-        // ── 3. Binary DB queries ──────────────────────────────────────────────
-        System.out.print("  Running binary DB queries...");
-        int[][] binaryResults = new int[queries.length][MAX_K];
-
-        for (int qi = 0; qi < WARMUP_QUERIES; qi++)
-            db.query(MAX_K, queries[qi]);
-
+        // ── 3a. Flat binary DB queries ────────────────────────────────────────
+        System.out.print("  Running flat binary queries...");
+        int[][] flatResults = new int[queries.length][MAX_K];
+        for (int qi = 0; qi < WARMUP_QUERIES; qi++) db.query(MAX_K, queries[qi]);
         long t2 = System.nanoTime();
         for (int qi = 0; qi < queries.length; qi++) {
             List<BinaryVector> results = db.query(MAX_K, queries[qi]);
             for (int k = 0; k < results.size(); k++)
-                binaryResults[qi][k] = Integer.parseInt(results.get(k).getMetadata()[0]);
+                flatResults[qi][k] = Integer.parseInt(results.get(k).getMetadata()[0]);
         }
-        long binaryNs = System.nanoTime() - t2;
-        System.out.printf(" %.1f ms%n", binaryNs / 1e6);
+        long flatNs = System.nanoTime() - t2;
+        System.out.printf(" %.1f ms%n", flatNs / 1e6);
 
-        // ── 4. Recall ─────────────────────────────────────────────────────────
-        double[] recalls = new double[K_VALUES.length];
+        // ── 3b. IVF binary DB queries ─────────────────────────────────────────
+        System.out.print("  Running IVF binary queries...");
+        int[][] ivfResults = new int[queries.length][MAX_K];
+        for (int qi = 0; qi < WARMUP_QUERIES; qi++) ivf.query(MAX_K, queries[qi]);
+        long ti2 = System.nanoTime();
+        for (int qi = 0; qi < queries.length; qi++) {
+            List<BinaryVector> results = ivf.query(MAX_K, queries[qi]);
+            for (int k = 0; k < results.size(); k++)
+                ivfResults[qi][k] = Integer.parseInt(results.get(k).getMetadata()[0]);
+        }
+        long ivfNs = System.nanoTime() - ti2;
+        System.out.printf(" %.1f ms%n", ivfNs / 1e6);
+
+        // ── 4. Recall & stats ─────────────────────────────────────────────────
+        double[] flatRecalls = new double[K_VALUES.length];
+        double[] ivfRecalls  = new double[K_VALUES.length];
+        for (int ki = 0; ki < K_VALUES.length; ki++) {
+            flatRecalls[ki] = computeRecall(groundTruth, flatResults, K_VALUES[ki]);
+            ivfRecalls[ki]  = computeRecall(groundTruth, ivfResults,  K_VALUES[ki]);
+        }
+
+        double exactUs = exactNs / 1e3 / queries.length;
+        double flatUs  = flatNs  / 1e3 / queries.length;
+        double ivfUs   = ivfNs   / 1e3 / queries.length;
+
+        System.out.printf("  Flat build: %d ms  |  IVF build: %d ms%n", flatBuildMs, ivfBuildMs);
+        System.out.printf("  Exact avg:  %.1f us/q%n", exactUs);
+        System.out.printf("  Flat  avg:  %.1f us/q  (%.2fx speedup)%n", flatUs,  (double)exactNs/flatNs);
+        System.out.printf("  IVF   avg:  %.1f us/q  (%.2fx speedup)%n", ivfUs,   (double)exactNs/ivfNs);
         for (int ki = 0; ki < K_VALUES.length; ki++)
-            recalls[ki] = computeRecall(groundTruth, binaryResults, K_VALUES[ki]);
-
-        double exactUsPerQuery  = exactNs  / 1e3 / queries.length;
-        double binaryUsPerQuery = binaryNs / 1e3 / queries.length;
-        double speedup          = (double) exactNs / binaryNs;
-
-        System.out.printf("  Build time:             %d ms%n", buildMs);
-        System.out.printf("  Exact  avg latency:     %.1f us/query%n", exactUsPerQuery);
-        System.out.printf("  Binary avg latency:     %.1f us/query%n", binaryUsPerQuery);
-        System.out.printf("  Speedup (exact/binary): %.2fx%n", speedup);
-        for (int ki = 0; ki < K_VALUES.length; ki++)
-            System.out.printf("  Recall@%-2d               %.4f%n", K_VALUES[ki], recalls[ki]);
+            System.out.printf("  Recall@%-2d   flat=%.4f  ivf=%.4f%n",
+                    K_VALUES[ki], flatRecalls[ki], ivfRecalls[ki]);
         System.out.println();
 
-        return String.format("| %5d | %8d | %11.1f | %11.1f | %9.2f | %9.4f |",
-                dim, buildMs, exactUsPerQuery, binaryUsPerQuery, speedup, recalls[K_VALUES.length - 1]);
+        return String.format("| %5d | %8d | %11.1f | %9.1f | %9.1f | flat=%.4f ivf=%.4f |",
+                dim, flatBuildMs, exactUs, flatUs, ivfUs,
+                flatRecalls[K_VALUES.length - 1], ivfRecalls[K_VALUES.length - 1]);
     }
 
     // ── Embedding file I/O ────────────────────────────────────────────────────
